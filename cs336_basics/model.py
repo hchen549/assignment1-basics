@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from cs336_basics.utils import scaled_dot_product_attention
+from tests.conftest import vocab_size
 
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -161,19 +162,17 @@ class CasualMHA(nn.Module):
         self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.n_h = num_heads
         self.theta = theta
-        self.register_buffer(
-            "mask",
-            (1 - torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)).to(
-                torch.bool
-            ),
-            persistent=False,
-        )
         if theta:
             self.rope = RotaryPositionalEmbedding(
                 d_k=d_model // num_heads, theta=theta, max_seq_len=max_seq_len
             )
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor = None,
+        mask: torch.Tensor | None = None,
+    ):
         b, s = x.size(0), x.size(1)
         query = (
             self.q_proj(x).reshape(b, s, self.n_h, -1).transpose(1, 2)
@@ -189,7 +188,8 @@ class CasualMHA(nn.Module):
             query = self.rope(query, token_positions)
             key = self.rope(key, token_positions)
 
-        mask = self.mask[:s, :s]
+        if mask is None:
+            mask = torch.tril(torch.ones(s, s, device=x.device, dtype=torch.bool))
         output = scaled_dot_product_attention(
             query, key, value, mask
         )  # (b, h, s, d_head)
@@ -213,9 +213,46 @@ class TransformerBlock(nn.Module):
         self.attn = CasualMHA(d_model, num_heads, max_seq_len, theta)
         self.ffn = SwiGLU(d_model, d_ff)
 
-    def forward(self, x):
+    def forward(self, x, mask: torch.Tensor | None = None):
         token_positions = torch.arange(x.size(1), device=x.device)
-        x = x + self.attn(self.ln1(x), token_positions)
+        x = x + self.attn(self.ln1(x), token_positions, mask)
         x = x + self.ffn(self.ln2(x))
+
+        return x
+
+
+class LLM(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        vocab_size: int,
+        num_heads: int,
+        d_ff: int,
+        context_lenght: int,
+        num_layers: int,
+        theta: Optional[float] = None,
+    ):
+        super().__init__()
+        self.token_embeddings = Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(d_model, num_heads, d_ff, context_lenght, theta)
+                for _ in range(num_layers)
+            ]
+        )
+        self.ln_final = RMSnorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(context_lenght, context_lenght, dtype=torch.bool)),
+            persistent=False,
+        )
+
+    def forward(self, x):
+        x = self.token_embeddings(x)
+        mask = self.mask[: x.size(1), : x.size(1)]
+        for layer in self.layers:
+            x = layer(x, mask)
+        x = self.lm_head(self.ln_final(x))
 
         return x

@@ -11,6 +11,7 @@ from cs336_basics.model import (
     CasualMHA,
     Embedding,
     Linear,
+    LLM,
     RMSnorm,
     RotaryPositionalEmbedding,
     SwiGLU,
@@ -99,7 +100,9 @@ def run_swiglu(
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
     swiglu = SwiGLU(d_model, d_ff)
-    swiglu.load_state_dict({"w1.weight": w1_weight, "w2.weight": w2_weight, "w3.weight": w3_weight})
+    swiglu.load_state_dict(
+        {"w1.weight": w1_weight, "w2.weight": w2_weight, "w3.weight": w3_weight}
+    )
     return swiglu(in_features)
 
 
@@ -395,7 +398,12 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model = LLM(
+        d_model, vocab_size, num_heads, d_ff, context_length, num_layers, rope_theta
+    )
+
+    model.load_state_dict(weights)
+    return model(in_indices)
 
 
 def run_rmsnorm(

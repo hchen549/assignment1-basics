@@ -1,7 +1,9 @@
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
+from cs336_basics.utils import scaled_dot_product_attention
 
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -91,14 +93,129 @@ class SwiGLU(nn.Module):
             d_ff = ((d_model * 8 // 3 + 63) // 64) * 64
         self.d_model = d_model
         self.d_ff = d_ff
-        self.w1 = nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(d_model, d_ff, device=device, dtype=dtype))
-        self.w3 = nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res1 = x @ self.w1.T
-        res3 = x @ self.w3.T
+        res1 = self.w1(x)
+        res3 = self.w3(x)
 
         res1 = res1 * torch.sigmoid(res1)
         intermediate = res1 * res3
-        return intermediate @ self.w2.T
+        return self.w2(intermediate)
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(
+        self,
+        d_k: int,
+        theta: float,
+        max_seq_len: int,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        assert d_k % 2 == 0, "d_k must be even for RoPE"
+        self.d_k = d_k
+
+        # inv_freq[i] = theta^(-2i/d_k) for i = 0 .. d_k/2 - 1
+        exponents = torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k
+        inv_freq = theta**-exponents
+
+        positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+        angles = positions[:, None] * inv_freq[None, :]  # [max_seq_len, d_k/2]
+
+        self.register_buffer("cos", torch.cos(angles), persistent=False)
+        self.register_buffer("sin", torch.sin(angles), persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        cos = self.cos[token_positions]  # [..., seq, d_k/2]
+        sin = self.sin[token_positions]
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+
+        out_even = x_even * cos - x_odd * sin
+        out_odd = x_even * sin + x_odd * cos
+
+        out = torch.empty_like(x)
+        out[..., 0::2] = out_even
+        out[..., 1::2] = out_odd
+        return out
+
+
+class CasualMHA(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int = 10000,
+        theta: float | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.n_h = num_heads
+        self.theta = theta
+        self.register_buffer(
+            "mask",
+            (1 - torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)).to(
+                torch.bool
+            ),
+            persistent=False,
+        )
+        if theta:
+            self.rope = RotaryPositionalEmbedding(
+                d_k=d_model // num_heads, theta=theta, max_seq_len=max_seq_len
+            )
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None):
+        b, s = x.size(0), x.size(1)
+        query = (
+            self.q_proj(x).reshape(b, s, self.n_h, -1).transpose(1, 2)
+        )  # (b, h, s, d_head)
+        key = (
+            self.k_proj(x).reshape(b, s, self.n_h, -1).transpose(1, 2)
+        )  # (b, h, s, d_head)
+        value = (
+            self.v_proj(x).reshape(b, s, self.n_h, -1).transpose(1, 2)
+        )  # (b, h, s, d_head)
+
+        if self.theta:
+            query = self.rope(query, token_positions)
+            key = self.rope(key, token_positions)
+
+        mask = self.mask[:s, :s]
+        output = scaled_dot_product_attention(
+            query, key, value, mask
+        )  # (b, h, s, d_head)
+        output = output.permute(0, 2, 1, 3).contiguous().view(b, s, -1)
+        return self.output_proj(output)  # ()
+
+
+class TransformerBlock(nn.Module):
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: Optional[int] = 10000,
+        theta: Optional[float] = None,
+    ):
+        super().__init__()
+        self.ln1 = RMSnorm(d_model)
+        self.ln2 = RMSnorm(d_model)
+        self.attn = CasualMHA(d_model, num_heads, max_seq_len, theta)
+        self.ffn = SwiGLU(d_model, d_ff)
+
+    def forward(self, x):
+        token_positions = torch.arange(x.size(1), device=x.device)
+        x = x + self.attn(self.ln1(x), token_positions)
+        x = x + self.ffn(self.ln2(x))
+
+        return x

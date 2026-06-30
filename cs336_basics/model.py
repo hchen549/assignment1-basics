@@ -13,6 +13,24 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return e / e.sum(dim=dim, keepdim=True)
 
 
+class Dropout(nn.Module):
+
+    def __init__(
+        self,
+        p: float = 0.5,  # dropout probability
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        keep_mask = torch.rand_like(x) >= self.p
+        return x * keep_mask / (1.0 - self.p)
+
+
 class Linear(nn.Module):
     def __init__(
         self,
